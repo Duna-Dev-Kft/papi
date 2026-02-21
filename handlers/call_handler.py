@@ -28,6 +28,7 @@ try:
     import win32gui
     import win32con
     import win32api
+    import win32process
     WIN32_AVAILABLE = True
 except ImportError:
     WIN32_AVAILABLE = False
@@ -106,35 +107,54 @@ class CallHandler:
     def _accept_in_telegram_desktop(self):
         """
         Megpróbálja automatikusan elfogadni a hívást a Telegram Desktop-ban.
-        1. Biztosítja, hogy a Telegram Desktop fut
-        2. Előre hozza az ablakot
-        3. Megkeresi és rákattint a zöld elfogad gombra
+
+        Telegram Desktop a bejövő hívást külön kis ablakban jelenítheti meg,
+        nem a fő ablakban. Ezért megkeresünk MINDEN Telegram.exe-hez tartozó
+        ablakot (PID alapján), és mindegyiken megpróbáljuk az elfogadást.
         """
         self._ensure_telegram_running()
         time.sleep(1.5)
 
-        hwnd = self._find_telegram_window()
-        if hwnd and WIN32_AVAILABLE:
-            self._bring_to_front(hwnd)
-            time.sleep(0.5)
+        all_hwnds = self._find_all_telegram_windows()
+        if not all_hwnds:
+            print("[CallHandler] Telegram ablak nem található")
+            return
+
+        print(f"[CallHandler] {len(all_hwnds)} Telegram ablak találva")
+        for hwnd in all_hwnds:
+            title = win32gui.GetWindowText(hwnd) if WIN32_AVAILABLE else "?"
+            rect = win32gui.GetWindowRect(hwnd) if WIN32_AVAILABLE else (0, 0, 0, 0)
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            print(f"  hwnd={hwnd} title='{title}' méret={w}x{h}")
 
         success = False
 
-        # 1. kísérlet: Windows UI Automation (API-alapú, megbízható)
-        if UIA_AVAILABLE and hwnd:
-            print("[CallHandler] UIA-alapú kattintás kísérlet...")
-            success = self._click_via_uia(hwnd)
+        for hwnd in all_hwnds:
+            if WIN32_AVAILABLE:
+                self._bring_to_front(hwnd)
+                time.sleep(0.4)
 
-        # 2. kísérlet: pixel-alapú fallback
-        if not success and PYAUTOGUI_AVAILABLE and hwnd and WIN32_AVAILABLE:
-            print("[CallHandler] Pixel-alapú kattintás kísérlet...")
-            success = self._click_green_accept_button(hwnd)
+            # UIA kísérlet
+            if UIA_AVAILABLE:
+                if self._click_via_uia(hwnd):
+                    success = True
+                    break
+
+            # Pixel fallback
+            if not success and PYAUTOGUI_AVAILABLE and WIN32_AVAILABLE:
+                if self._click_green_accept_button(hwnd):
+                    success = True
+                    break
 
         if success:
             print("[CallHandler] Auto-elfogadás sikerült!")
-            self.overlay.close()
         else:
-            print("[CallHandler] Auto-elfogadás nem sikerült – overlay megmarad")
+            # Legalább a legkisebb ablakot hozzuk előre (valószínűleg a hívás popup)
+            # A legkisebb ablak általában a hívás értesítő, nem a fő ablak
+            if WIN32_AVAILABLE and all_hwnds:
+                call_hwnd = self._pick_call_window(all_hwnds)
+                self._bring_to_front(call_hwnd)
+            print("[CallHandler] Auto-elfogadás nem sikerült – Telegram előtérben")
 
     def _ensure_telegram_running(self):
         """Elindítja a Telegram Desktop-ot, ha nem fut."""
@@ -152,22 +172,85 @@ class CallHandler:
         print("[CallHandler] Telegram Desktop nem található – kézzel kell indítani")
 
     def _find_telegram_window(self):
-        """Megkeresi a Telegram Desktop ablak handle-jét."""
+        """Visszaadja az első Telegram ablakot (kompatibilitáshoz megmarad)."""
+        windows = self._find_all_telegram_windows()
+        return windows[0] if windows else None
+
+    def _find_all_telegram_windows(self):
+        """
+        Megkeresi az összes Telegram.exe-hez tartozó látható ablakot.
+        PID alapján keres, így a hívás popup ablakot is megtalálja,
+        még ha a címe nem 'Telegram'.
+        """
         if not WIN32_AVAILABLE:
-            return None
+            return []
+
+        # Telegram.exe PID-ek lekérése tasklist segítségével
+        telegram_pids = self._get_telegram_pids()
+        if not telegram_pids:
+            # Fallback: cím alapján keresés
+            found = []
+            def title_cb(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd) and "Telegram" in win32gui.GetWindowText(hwnd):
+                    found.append(hwnd)
+                return True
+            win32gui.EnumWindows(title_cb, None)
+            return found
 
         found = []
 
         def callback(hwnd, _):
             if not win32gui.IsWindowVisible(hwnd):
                 return True
-            title = win32gui.GetWindowText(hwnd)
-            if "Telegram" in title:
-                found.append(hwnd)
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid in telegram_pids:
+                    rect = win32gui.GetWindowRect(hwnd)
+                    w = rect[2] - rect[0]
+                    h = rect[3] - rect[1]
+                    if w > 80 and h > 80:   # apró helper ablakokat kihagyjuk
+                        found.append(hwnd)
+            except Exception:
+                pass
             return True
 
         win32gui.EnumWindows(callback, None)
-        return found[0] if found else None
+        return found
+
+    def _get_telegram_pids(self) -> set:
+        """Visszaadja a futó Telegram.exe folyamatok PID-jeit."""
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Telegram.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            pids = set()
+            for line in result.stdout.strip().splitlines():
+                parts = line.strip('"').split('","')
+                if len(parts) >= 2:
+                    try:
+                        pids.add(int(parts[1]))
+                    except ValueError:
+                        pass
+            return pids
+        except Exception:
+            return set()
+
+    def _pick_call_window(self, hwnds: list) -> int:
+        """
+        A hívás popup ablakot választja ki a listából.
+        A popup általában kisebb, mint a fő ablak.
+        Ha csak egy ablak van, azt adja vissza.
+        """
+        if len(hwnds) == 1:
+            return hwnds[0]
+
+        # Méret szerint rendezve – a legkisebb valószínűleg a hívás popup
+        def area(hwnd):
+            r = win32gui.GetWindowRect(hwnd)
+            return (r[2] - r[0]) * (r[3] - r[1])
+
+        return min(hwnds, key=area)
 
     def _bring_to_front(self, hwnd):
         """Előre hozza a Telegram Desktop ablakot."""

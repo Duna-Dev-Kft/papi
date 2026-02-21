@@ -118,9 +118,14 @@ class CallOverlay:
             btn_frame.pack(pady=60)
 
             def on_accept():
-                if self._accept_callback:
-                    threading.Thread(target=self._accept_callback, daemon=True).start()
+                # Először bezárjuk az overlayt, UTÁNA indítjuk a callbacket
+                # (hogy a fullscreen ablak ne takarja a Telegram-ot)
                 self._close_window(root)
+                if self._accept_callback:
+                    def delayed():
+                        time.sleep(0.4)   # várjuk meg hogy az overlay eltűnjön
+                        self._accept_callback()
+                    threading.Thread(target=delayed, daemon=True).start()
 
             def on_decline():
                 self._close_window(root)
