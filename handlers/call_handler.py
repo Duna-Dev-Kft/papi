@@ -15,6 +15,7 @@ import asyncio
 import subprocess
 import time
 import threading
+import ctypes
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -108,12 +109,16 @@ class CallHandler:
         """
         Megpróbálja automatikusan elfogadni a hívást a Telegram Desktop-ban.
 
-        Telegram Desktop a bejövő hívást külön kis ablakban jelenítheti meg,
-        nem a fő ablakban. Ezért megkeresünk MINDEN Telegram.exe-hez tartozó
-        ablakot (PID alapján), és mindegyiken megpróbáljuk az elfogadást.
+        FONTOS: Az overlay-t ELŐSZÖR bezárjuk, különben a fullscreen topmost
+        ablak takarja a Telegram hívás popup-ját – sem a pixelkereső, sem az
+        UIA nem látja a gombot, amíg az overlay előttük van.
         """
+        # 1. Overlay bezárása – Telegram hívás UI láthatóvá válik
+        self.overlay.close()
+        time.sleep(0.6)   # hagyjuk hogy az ablak teljesen eltűnjön
+
         self._ensure_telegram_running()
-        time.sleep(1.5)
+        time.sleep(1.0)
 
         all_hwnds = self._find_all_telegram_windows()
         if not all_hwnds:
@@ -343,6 +348,49 @@ class CallHandler:
         except Exception:
             pass
 
+    def _capture_window_region(self, hwnd, rx, ry, rw, rh):
+        """
+        PrintWindow API-val fotózza le az ablak egy részét.
+        Akkor is működik ha más ablak takarja (pl. az overlay).
+        Visszatér PIL Image-dzsel, vagy None-nal hiba esetén.
+        """
+        try:
+            import win32ui
+            from PIL import Image as PilImage
+
+            hwnd_dc = win32gui.GetWindowDC(hwnd)
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+
+            rect = win32gui.GetWindowRect(hwnd)
+            full_w = rect[2] - rect[0]
+            full_h = rect[3] - rect[1]
+
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(mfc_dc, full_w, full_h)
+            save_dc.SelectObject(bmp)
+
+            # PW_RENDERFULLCONTENT = 2, lefotózza az ablakot ha takart is
+            ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+
+            bmp_info = bmp.GetInfo()
+            bmp_str = bmp.GetBitmapBits(True)
+            img = PilImage.frombuffer(
+                "RGB",
+                (bmp_info["bmWidth"], bmp_info["bmHeight"]),
+                bmp_str, "raw", "BGRX", 0, 1,
+            )
+
+            win32gui.DeleteObject(bmp.GetHandle())
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+            return img.crop((rx, ry, rx + rw, ry + rh))
+        except Exception as e:
+            print(f"[CallHandler] PrintWindow hiba: {e}")
+            return None
+
     def _click_green_accept_button(self, hwnd) -> bool:
         """
         Megkeresi a zöld "Elfogad" gombot a Telegram hívásjelző sávban.
@@ -362,9 +410,12 @@ class CallHandler:
             search_w = min(460, ww // 2)
             search_h = min(180, wh // 4)
 
-            screenshot = ImageGrab.grab(
-                bbox=(wx, wy, wx + search_w, wy + search_h)
-            )
+            # PrintWindow: az ablak valódi tartalmát kapjuk még akkor is,
+            # ha valami más ablak takarja (pl. korábban az overlay)
+            screenshot = self._capture_window_region(hwnd, 0, 0, search_w, search_h)
+            if screenshot is None:
+                # fallback: sima screenshot
+                screenshot = ImageGrab.grab(bbox=(wx, wy, wx + search_w, wy + search_h))
             width, height = screenshot.size
 
             # Telegram elfogad gomb zöldje: #4dcd5e, #5cb85c, #00c853 stb.
