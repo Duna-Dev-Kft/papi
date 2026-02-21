@@ -40,6 +40,13 @@ try:
 except ImportError:
     PYAUTOGUI_AVAILABLE = False
 
+try:
+    import uiautomation as auto
+    UIA_AVAILABLE = True
+except ImportError:
+    UIA_AVAILABLE = False
+    print("[CallHandler] uiautomation nem elérhető – UIA-alapú kattintás kihagyva")
+
 from ui.call_overlay import CallOverlay
 from config import TELEGRAM_PATHS, AUTO_ANSWER_DELAY
 
@@ -112,7 +119,15 @@ class CallHandler:
             time.sleep(0.5)
 
         success = False
-        if PYAUTOGUI_AVAILABLE and hwnd and WIN32_AVAILABLE:
+
+        # 1. kísérlet: Windows UI Automation (API-alapú, megbízható)
+        if UIA_AVAILABLE and hwnd:
+            print("[CallHandler] UIA-alapú kattintás kísérlet...")
+            success = self._click_via_uia(hwnd)
+
+        # 2. kísérlet: pixel-alapú fallback
+        if not success and PYAUTOGUI_AVAILABLE and hwnd and WIN32_AVAILABLE:
+            print("[CallHandler] Pixel-alapú kattintás kísérlet...")
             success = self._click_green_accept_button(hwnd)
 
         if success:
@@ -165,46 +180,167 @@ class CallHandler:
         except Exception as e:
             print(f"[CallHandler] Ablak előre hozása sikertelen: {e}")
 
+    def _click_via_uia(self, hwnd) -> bool:
+        """
+        Windows UI Automation alapú kattintás.
+        Az accessibility tree-n keresztül keresi a hívás elfogadó gombot
+        – nem pixel, hanem vezérlő neve/szerepe alapján.
+
+        Telegram Desktop Qt-alapú, a gomb neve angolul vagy lokalizáltan
+        jelenhet meg. Ha nem találja névvel, végigmegy az összes Button-on
+        és amelyik a hívásjelző területen van (ablak teteje), arra kattint.
+        """
+        if not UIA_AVAILABLE:
+            return False
+        try:
+            # Az ablak accessibility objektuma hwnd alapján
+            ctrl = auto.ControlFromHandle(hwnd)
+            if ctrl is None:
+                return False
+
+            # Ismert gombnevek (Telegram különböző verziók / nyelvek)
+            candidate_names = [
+                "Accept call", "Answer call", "Answer", "Accept",
+                "Fogadás", "Elfogad", "Felvesz",
+                "accept_call", "answer",
+            ]
+
+            for name in candidate_names:
+                try:
+                    btn = ctrl.ButtonControl(searchDepth=8, Name=name)
+                    if btn.Exists(maxSearchSeconds=0.3):
+                        print(f"[UIA] Gomb megtalálva névvel: '{name}'")
+                        btn.Click()
+                        return True
+                except Exception:
+                    pass
+
+            # Névvel nem sikerült – végigmegyünk az összes gombon,
+            # és amelyik az ablak felső részén van (hívásjelző sáv), arra kattintunk
+            print("[UIA] Névvel nem találtam, keresem pozíció alapján...")
+
+            window_rect = win32gui.GetWindowRect(hwnd)
+            win_top = window_rect[1]
+            call_bar_bottom = win_top + 200  # hívásjelző sáv max 200px magas
+
+            all_buttons = ctrl.GetChildren()
+            self._collect_buttons(ctrl, all_buttons, depth=6)
+
+            for btn in all_buttons:
+                try:
+                    if btn.ControlType != auto.ControlType.ButtonControl:
+                        continue
+                    r = btn.BoundingRectangle
+                    # A gomb a képernyő felső részén van (hívásjelző sávban)
+                    if r.top < call_bar_bottom and r.width() > 10 and r.height() > 10:
+                        print(
+                            f"[UIA] Gomb pozíció alapján: '{btn.Name}' "
+                            f"@ ({r.left},{r.top})"
+                        )
+                        btn.Click()
+                        return True
+                except Exception:
+                    pass
+
+            print("[UIA] Nem találtam elfogadó gombot az accessibility tree-ben")
+            return False
+
+        except Exception as e:
+            print(f"[UIA] Hiba: {e}")
+            return False
+
+    def _collect_buttons(self, ctrl, result: list, depth: int):
+        """Rekurzívan összegyűjti az összes Button vezérlőt."""
+        if depth <= 0:
+            return
+        try:
+            for child in ctrl.GetChildren():
+                result.append(child)
+                self._collect_buttons(child, result, depth - 1)
+        except Exception:
+            pass
+
     def _click_green_accept_button(self, hwnd) -> bool:
         """
-        Megkeresi a zöld "Elfogad" gombot a Telegram ablakban
-        RGB pixel-szín alapján, majd rákattint.
-        Visszatérési érték: True ha sikerült kattintani.
+        Megkeresi a zöld "Elfogad" gombot a Telegram hívásjelző sávban.
+
+        A Telegram Desktop hívásjelző sávja a bal panel TETEJÉN jelenik meg
+        (kb. felső 160px, bal 420px). Az online jelzők (kis zöld pontok) a
+        névsor többi részén találhatók – azokat szűrjük ki azzal, hogy csak
+        a felső sávban keresünk, és koncentrált klasztert keresünk.
         """
         try:
             rect = win32gui.GetWindowRect(hwnd)
-            wx, wy, ww, wh = rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]
+            wx, wy = rect[0], rect[1]
+            ww = rect[2] - rect[0]
+            wh = rect[3] - rect[1]
 
-            # Képernyőkép az ablakról
-            screenshot = ImageGrab.grab(bbox=(wx, wy, wx + ww, wy + wh))
+            # Csak a bal panel felső részét vizsgáljuk (hívásjelző sáv területe)
+            search_w = min(460, ww // 2)
+            search_h = min(180, wh // 4)
 
-            # Zöld pixelek keresése (Telegram zöld: ~#4dcd5e vagy #00d26a)
-            green_cluster = []
+            screenshot = ImageGrab.grab(
+                bbox=(wx, wy, wx + search_w, wy + search_h)
+            )
             width, height = screenshot.size
 
-            for y in range(0, height, 3):
-                for x in range(0, width, 3):
-                    pixel = screenshot.getpixel((x, y))
-                    r, g, b = pixel[0], pixel[1], pixel[2]
-                    # Zöld: magas G, alacsony R és B
-                    if g > 140 and r < 120 and b < 120:
-                        green_cluster.append((x, y))
+            # Telegram elfogad gomb zöldje: #4dcd5e, #5cb85c, #00c853 stb.
+            # R < 120, G > 160, B < 130
+            green_pixels = []
+            for y in range(0, height, 2):
+                for x in range(0, width, 2):
+                    r, g, b = screenshot.getpixel((x, y))[:3]
+                    if g > 160 and r < 120 and b < 130:
+                        green_pixels.append((x, y))
 
-            if len(green_cluster) < 20:
-                print("[CallHandler] Zöld gomb nem található a képernyőn")
+            print(f"[CallHandler] Zöld pixelek a hívássávban: {len(green_pixels)}")
+
+            if len(green_pixels) < 12:
+                print("[CallHandler] Zöld gomb nem található a hívássávban")
                 return False
 
-            # Kattintás a klaszter közepére
-            avg_x = sum(p[0] for p in green_cluster) // len(green_cluster)
-            avg_y = sum(p[1] for p in green_cluster) // len(green_cluster)
+            # Legsűrűbb klaszter keresése (a gomb egy koncentrált folt,
+            # az online jelzők szétszórtak)
+            center = self._find_dense_cluster(green_pixels, radius=18, min_count=10)
+            if not center:
+                print("[CallHandler] Nem találtam koncentrált zöld klasztert")
+                return False
 
-            screen_x = wx + avg_x
-            screen_y = wy + avg_y
+            screen_x = wx + center[0]
+            screen_y = wy + center[1]
 
-            print(f"[CallHandler] Zöld gomb megtalálva: ({screen_x}, {screen_y}) – kattintás")
+            print(f"[CallHandler] Zöld gomb: ({screen_x}, {screen_y}) – kattintás")
             pyautogui.click(screen_x, screen_y)
             return True
 
         except Exception as e:
             print(f"[CallHandler] Gombkeresés hiba: {e}")
             return False
+
+    def _find_dense_cluster(self, pixels, radius=18, min_count=10):
+        """
+        Megkeresi a legsűrűbb pixel-klasztert.
+        Visszaadja a klaszter középpontját (x, y), vagy None-t.
+        """
+        if not pixels:
+            return None
+
+        best_center = None
+        best_count = 0
+
+        # Mintavételezés: minden 3. pixel lehet klaszterközpont
+        for px, py in pixels[::3]:
+            nearby = [
+                (qx, qy) for qx, qy in pixels
+                if abs(qx - px) <= radius and abs(qy - py) <= radius
+            ]
+            if len(nearby) > best_count:
+                best_count = len(nearby)
+                best_center = (
+                    sum(q[0] for q in nearby) // len(nearby),
+                    sum(q[1] for q in nearby) // len(nearby),
+                )
+
+        if best_count < min_count:
+            return None
+        return best_center

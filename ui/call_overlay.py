@@ -75,7 +75,6 @@ class CallOverlay:
                 font=("Arial", 28, "bold"),
                 bg=CALL_BG_COLOR,
                 fg="#aaaaaa",
-                letterSpacing=4,
             )
             status_label.pack(pady=(10, 0))
 
