@@ -113,6 +113,13 @@ class CallHandler:
         ablak takarja a Telegram hívás popup-ját – sem a pixelkereső, sem az
         UIA nem látja a gombot, amíg az overlay előttük van.
         """
+        # COM inicializálás – szálban kötelező UIA előtt
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+
         # 1. Overlay bezárása – Telegram hívás UI láthatóvá válik
         self.overlay.close()
         time.sleep(0.6)   # hagyjuk hogy az ablak teljesen eltűnjön
@@ -271,80 +278,88 @@ class CallHandler:
     def _click_via_uia(self, hwnd) -> bool:
         """
         Windows UI Automation alapú kattintás.
-        Az accessibility tree-n keresztül keresi a hívás elfogadó gombot
-        – nem pixel, hanem vezérlő neve/szerepe alapján.
 
-        Telegram Desktop Qt-alapú, a gomb neve angolul vagy lokalizáltan
-        jelenhet meg. Ha nem találja névvel, végigmegy az összes Button-on
-        és amelyik a hívásjelző területen van (ablak teteje), arra kattint.
+        Telegram Desktop Qt-ban a gomb típusa nem feltétlenül ButtonControl –
+        lehet CustomControl vagy más. Ezért:
+          1. Minden vezérlőtípusban keresünk "Accept" nevűt
+          2. Ha nincs, kilistázzuk az összes vezérlőt (debug) és a
+             felső sávban lévőre kattintunk
         """
         if not UIA_AVAILABLE:
             return False
         try:
-            # Az ablak accessibility objektuma hwnd alapján
             ctrl = auto.ControlFromHandle(hwnd)
             if ctrl is None:
                 return False
 
-            # Ismert gombnevek (Telegram különböző verziók / nyelvek)
-            candidate_names = [
-                "Accept call", "Answer call", "Answer", "Accept",
-                "Fogadás", "Elfogad", "Felvesz",
-                "accept_call", "answer",
+            # 1. Keresés névvel – BÁRMILYEN vezérlőtípusban
+            # (Telegram Qt nem mindig ButtonControl-ként regisztrál)
+            accept_names = [
+                "Accept", "Accept call", "Answer", "Answer call",
+                "Fogadás", "Elfogad",
             ]
-
-            for name in candidate_names:
+            for name in accept_names:
                 try:
-                    btn = ctrl.ButtonControl(searchDepth=8, Name=name)
-                    if btn.Exists(maxSearchSeconds=0.3):
-                        print(f"[UIA] Gomb megtalálva névvel: '{name}'")
-                        btn.Click()
+                    # Control() = bármilyen típus
+                    found = ctrl.Control(searchDepth=10, Name=name)
+                    if found.Exists(maxSearchSeconds=0.5):
+                        print(f"[UIA] Vezérlő megtalálva: '{name}' "
+                              f"(típus: {found.ControlTypeName})")
+                        found.Click()
                         return True
                 except Exception:
                     pass
 
-            # Névvel nem sikerült – végigmegyünk az összes gombon,
-            # és amelyik az ablak felső részén van (hívásjelző sáv), arra kattintunk
-            print("[UIA] Névvel nem találtam, keresem pozíció alapján...")
+            # 2. Debug: listázzuk az összes vezérlőt a fő ablakban
+            print("[UIA] Nem találtam 'Accept' nevűt – összes vezérlő:")
+            all_ctrls: list = []
+            self._collect_all_controls(ctrl, all_ctrls, depth=6)
 
             window_rect = win32gui.GetWindowRect(hwnd)
             win_top = window_rect[1]
-            call_bar_bottom = win_top + 200  # hívásjelző sáv max 200px magas
+            call_bar_bottom = win_top + 250
 
-            all_buttons = ctrl.GetChildren()
-            self._collect_buttons(ctrl, all_buttons, depth=6)
-
-            for btn in all_buttons:
+            for c in all_ctrls:
                 try:
-                    if btn.ControlType != auto.ControlType.ButtonControl:
-                        continue
-                    r = btn.BoundingRectangle
-                    # A gomb a képernyő felső részén van (hívásjelző sávban)
-                    if r.top < call_bar_bottom and r.width() > 10 and r.height() > 10:
-                        print(
-                            f"[UIA] Gomb pozíció alapján: '{btn.Name}' "
-                            f"@ ({r.left},{r.top})"
-                        )
-                        btn.Click()
-                        return True
+                    r = c.BoundingRectangle
+                    name = c.Name or ""
+                    ctype = c.ControlTypeName
+                    # Kiírjuk a felső 250px-en lévő összes elemet
+                    if r.top < call_bar_bottom and r.width() > 5 and r.height() > 5:
+                        print(f"  [{ctype}] '{name}' @ ({r.left},{r.top}) "
+                              f"{r.width()}x{r.height()}")
                 except Exception:
                     pass
 
-            print("[UIA] Nem találtam elfogadó gombot az accessibility tree-ben")
+            # 3. Kattintás az első kattintható elemre a felső sávban
+            for c in all_ctrls:
+                try:
+                    r = c.BoundingRectangle
+                    if r.top < call_bar_bottom and r.width() > 20 and r.height() > 20:
+                        patterns = c.GetSupportedPatterns()
+                        # InvokePattern = kattintható/aktiválható elem
+                        if any("Invoke" in str(p) for p in patterns):
+                            print(f"[UIA] Kattintás: '{c.Name}' @ ({r.left},{r.top})")
+                            c.Click()
+                            return True
+                except Exception:
+                    pass
+
+            print("[UIA] Nem találtam kattintható elemet")
             return False
 
         except Exception as e:
             print(f"[UIA] Hiba: {e}")
             return False
 
-    def _collect_buttons(self, ctrl, result: list, depth: int):
-        """Rekurzívan összegyűjti az összes Button vezérlőt."""
+    def _collect_all_controls(self, ctrl, result: list, depth: int):
+        """Rekurzívan összegyűjti az összes UIA vezérlőt."""
         if depth <= 0:
             return
         try:
             for child in ctrl.GetChildren():
                 result.append(child)
-                self._collect_buttons(child, result, depth - 1)
+                self._collect_all_controls(child, result, depth - 1)
         except Exception:
             pass
 
