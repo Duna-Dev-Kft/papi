@@ -1,22 +1,27 @@
 """
-Üzenetjelző popup ablak.
-Megjelenik a képernyő jobb felső sarkában, minden más ablak felett.
-Automatikusan eltűnik néhány másodperc múlva.
+Üzenetjelző ablak – a hívásjelzőhöz hasonló nagy, teljes képernyős stílus.
+Megjelenik minden más ablak felett, marad amíg az OK gombot meg nem nyomják.
 """
 
 import tkinter as tk
 import threading
-from config import MSG_BG_COLOR, MSG_TEXT_COLOR, MSG_FONT_SIZE, MSG_DISPLAY_SECONDS
+
+BG_COLOR     = "#0d1b2a"
+HEADER_COLOR = "#1b4f72"
+TEXT_COLOR   = "#ffffff"
+BTN_OK_COLOR = "#2196f3"
+BTN_TG_COLOR = "#1e88e5"
 
 
 class MessageOverlay:
     def __init__(self):
-        self._windows = []
         self._lock = threading.Lock()
-        self._y_offset = 20  # következő ablak y pozíciója
+        self._root = None
 
     def show(self, sender_name: str, message_text: str, open_callback=None):
-        """Megmutat egy üzenet értesítőt."""
+        """Megmutatja az üzenetjelző ablakot."""
+        # Ha már van nyitott ablak, azt bezárjuk és újat nyitunk
+        self._close_existing()
         t = threading.Thread(
             target=self._run_window,
             args=(sender_name, message_text, open_callback),
@@ -24,113 +29,145 @@ class MessageOverlay:
         )
         t.start()
 
+    def _close_existing(self):
+        with self._lock:
+            if self._root:
+                try:
+                    self._root.quit()
+                    self._root.destroy()
+                except Exception:
+                    pass
+                self._root = None
+
     def _run_window(self, sender_name: str, message_text: str, open_callback):
         try:
             root = tk.Tk()
-            root.overrideredirect(True)          # nincs ablakkeret
-            root.attributes("-topmost", True)    # minden felett
-            root.attributes("-alpha", 0.95)      # enyhén átlátszó
-            root.configure(bg=MSG_BG_COLOR)
+            with self._lock:
+                self._root = root
 
-            # Méret és pozíció
-            width = 440
+            root.title("Új üzenet")
+            root.attributes("-topmost", True)
+            root.configure(bg=BG_COLOR)
+            root.focus_force()
+
             screen_w = root.winfo_screenwidth()
             screen_h = root.winfo_screenheight()
 
-            # Vízszintes pozíció: jobb felső sarok
-            x = screen_w - width - 20
+            # Ablak mérete: képernyő 55%-a, középre igazítva
+            win_w = int(screen_w * 0.55)
+            win_h = int(screen_h * 0.60)
+            x = (screen_w - win_w) // 2
+            y = (screen_h - win_h) // 2
+            root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+            root.resizable(False, False)
 
-            # Függőleges: más értesítők alatt
-            with self._lock:
-                y = self._y_offset
-                self._y_offset += 160
-                self._windows.append(root)
-
-            root.geometry(f"{width}x150+{x}+{y}")
-
-            # --- Fejléc: feladó ---
-            header = tk.Frame(root, bg="#2980b9", padx=12, pady=8)
+            # --- Fejléc ---
+            header = tk.Frame(root, bg=HEADER_COLOR, pady=18)
             header.pack(fill="x")
 
-            sender_label = tk.Label(
+            tk.Label(
                 header,
-                text=f"💬  {sender_name}",
-                font=("Arial", MSG_FONT_SIZE - 2, "bold"),
-                bg="#2980b9",
+                text="💬",
+                font=("Arial", 36),
+                bg=HEADER_COLOR,
                 fg="#ffffff",
-                anchor="w",
-            )
-            sender_label.pack(fill="x")
+            ).pack()
 
-            # --- Üzenet szöveg ---
-            body = tk.Frame(root, bg=MSG_BG_COLOR, padx=12, pady=10)
+            tk.Label(
+                header,
+                text="ÚJ ÜZENET",
+                font=("Arial", 16, "bold"),
+                bg=HEADER_COLOR,
+                fg="#aaccee",
+            ).pack()
+
+            tk.Label(
+                header,
+                text=sender_name,
+                font=("Arial", 28, "bold"),
+                bg=HEADER_COLOR,
+                fg="#ffffff",
+            ).pack(pady=(4, 0))
+
+            # --- Elválasztó ---
+            tk.Frame(root, bg="#2980b9", height=3).pack(fill="x")
+
+            # --- Üzenet szöveg (görgethetővé tehető hosszú üzenetnél) ---
+            body = tk.Frame(root, bg=BG_COLOR, padx=30, pady=20)
             body.pack(fill="both", expand=True)
 
-            # Megjelenítendő szöveg (max 100 karakter)
-            preview = message_text[:100] + ("…" if len(message_text) > 100 else "")
-
-            msg_label = tk.Label(
+            text_widget = tk.Text(
                 body,
-                text=preview,
-                font=("Arial", MSG_FONT_SIZE - 4),
-                bg=MSG_BG_COLOR,
-                fg=MSG_TEXT_COLOR,
-                wraplength=width - 24,
-                justify="left",
-                anchor="nw",
+                font=("Arial", 20),
+                bg="#122333",
+                fg=TEXT_COLOR,
+                relief="flat",
+                wrap="word",
+                state="normal",
+                cursor="arrow",
+                padx=14,
+                pady=14,
+                borderwidth=0,
+                highlightthickness=0,
             )
-            msg_label.pack(fill="both", expand=True)
+            text_widget.insert("1.0", message_text)
+            text_widget.config(state="disabled")   # csak olvasható
+            text_widget.pack(fill="both", expand=True)
 
-            # Kattintásra megnyitja a Telegram Desktop-ot
-            def on_click(event=None):
+            # --- Gombok ---
+            btn_frame = tk.Frame(root, bg=BG_COLOR, pady=20)
+            btn_frame.pack(fill="x")
+
+            def on_ok():
+                _close()
+
+            def on_open_telegram():
                 if open_callback:
                     threading.Thread(target=open_callback, daemon=True).start()
-                close_window()
+                _close()
 
-            root.bind("<Button-1>", on_click)
-            header.bind("<Button-1>", on_click)
-            sender_label.bind("<Button-1>", on_click)
-            body.bind("<Button-1>", on_click)
-            msg_label.bind("<Button-1>", on_click)
-
-            # Bezárás gomb (kis "×" jobb felső sarokban)
-            close_btn = tk.Label(
-                root,
-                text="✕",
-                font=("Arial", 14),
-                bg="#1a5276",
-                fg="#aaaaaa",
-                cursor="hand2",
-                padx=6,
-            )
-            close_btn.place(relx=1.0, rely=0.0, anchor="ne")
-            close_btn.bind("<Button-1>", lambda e: close_window())
-
-            def close_window():
+            def _close():
                 with self._lock:
-                    if root in self._windows:
-                        self._windows.remove(root)
-                    # y_offset visszaállítása ha üres
-                    if not self._windows:
-                        self._y_offset = 20
+                    self._root = None
                 try:
                     root.quit()
                     root.destroy()
                 except Exception:
                     pass
 
-            # Automatikus bezárás
-            root.after(MSG_DISPLAY_SECONDS * 1000, close_window)
+            tk.Button(
+                btn_frame,
+                text="Telegram megnyitása",
+                font=("Arial", 16),
+                bg=BTN_TG_COLOR,
+                fg="#ffffff",
+                activebackground="#42a5f5",
+                relief="flat",
+                padx=24,
+                pady=12,
+                cursor="hand2",
+                command=on_open_telegram,
+            ).pack(side="left", padx=(40, 10))
 
-            # Belépési animáció (fade in)
-            root.attributes("-alpha", 0.0)
-            def fade_in(alpha=0.0):
-                alpha = min(alpha + 0.1, 0.95)
-                root.attributes("-alpha", alpha)
-                if alpha < 0.95:
-                    root.after(30, lambda: fade_in(alpha))
+            tk.Button(
+                btn_frame,
+                text="   OK   ",
+                font=("Arial", 20, "bold"),
+                bg=BTN_OK_COLOR,
+                fg="#ffffff",
+                activebackground="#64b5f6",
+                relief="flat",
+                padx=40,
+                pady=12,
+                cursor="hand2",
+                command=on_ok,
+            ).pack(side="right", padx=(10, 40))
 
-            root.after(50, fade_in)
+            # Enter / Space is bezárja
+            root.bind("<Return>", lambda e: on_ok())
+            root.bind("<space>", lambda e: on_ok())
+            root.bind("<Escape>", lambda e: on_ok())
+
             root.mainloop()
 
         except Exception as e:
