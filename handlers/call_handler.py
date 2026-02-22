@@ -160,6 +160,9 @@ class CallHandler:
 
         if success:
             print("[CallHandler] Auto-elfogadás sikerült!")
+            # 2 másodperccel később Start Video gomb
+            time.sleep(2.0)
+            self._click_start_video()
         else:
             # Legalább a legkisebb ablakot hozzuk előre (valószínűleg a hívás popup)
             # A legkisebb ablak általában a hívás értesítő, nem a fő ablak
@@ -275,15 +278,26 @@ class CallHandler:
         except Exception as e:
             print(f"[CallHandler] Ablak előre hozása sikertelen: {e}")
 
-    def _click_via_uia(self, hwnd) -> bool:
+    def _click_start_video(self):
         """
-        Windows UI Automation alapú kattintás.
+        Megkeresi és megnyomja a 'Start Video' gombot a hívás ablakban.
+        Ugyanaz a minta mint az Accept-nél: a label szülőjére kattintunk.
+        """
+        print("[CallHandler] Start Video gomb keresése...")
+        all_hwnds = self._find_all_telegram_windows()
 
-        Telegram Desktop Qt-ban a gomb típusa nem feltétlenül ButtonControl –
-        lehet CustomControl vagy más. Ezért:
-          1. Minden vezérlőtípusban keresünk "Accept" nevűt
-          2. Ha nincs, kilistázzuk az összes vezérlőt (debug) és a
-             felső sávban lévőre kattintunk
+        for hwnd in all_hwnds:
+            if self._click_label_or_parent(hwnd, ["Start Video", "Video", "Videó"]):
+                print("[CallHandler] Start Video sikerült!")
+                return
+
+        print("[CallHandler] Start Video gomb nem található")
+
+    def _click_label_or_parent(self, hwnd, candidate_names: list) -> bool:
+        """
+        Megkeres egy vezérlőt a megadott nevek egyikével, majd:
+        - ha label/text típus → szülőjére kattint (az a tényleges gomb)
+        - egyébként → magára a vezérlőre kattint
         """
         if not UIA_AVAILABLE:
             return False
@@ -292,12 +306,9 @@ class CallHandler:
             if ctrl is None:
                 return False
 
-            # 1. Keresés névvel – BÁRMILYEN vezérlőtípusban
-            accept_names = [
-                "Accept", "Accept call", "Answer", "Answer call",
-                "Fogadás", "Elfogad",
-            ]
-            for name in accept_names:
+            label_types = {"TextControl", "StaticControl", "LabelControl"}
+
+            for name in candidate_names:
                 try:
                     found = ctrl.Control(searchDepth=10, Name=name)
                     if not found.Exists(maxSearchSeconds=0.5):
@@ -306,18 +317,15 @@ class CallHandler:
                     r = found.BoundingRectangle
                     ctype = found.ControlTypeName
                     aid = found.AutomationId or ""
-                    print(f"[UIA] Megtalálva: '{name}' ({ctype}) id='{aid}' @ ({r.left},{r.top}) {r.width()}x{r.height()}")
+                    print(f"[UIA] '{name}' ({ctype}) id='{aid}' @ ({r.left},{r.top})")
 
-                    # Ha szöveg/label: keressük a szülőjét (az a tényleges gomb)
-                    label_types = {"TextControl", "StaticControl", "LabelControl"}
                     if ctype in label_types:
                         parent = found.GetParentControl()
                         if parent is not None:
                             pr = parent.BoundingRectangle
-                            print(f"[UIA] Szülő: '{parent.Name}' ({parent.ControlTypeName}) id='{parent.AutomationId}' @ ({pr.left},{pr.top})")
+                            print(f"[UIA] Szülő: ({pr.left},{pr.top}) → kattintás")
                             parent.Click()
                         else:
-                            # nincs szülő: kattintunk fölé
                             pyautogui.click(r.left + r.width() // 2, r.top - 35)
                     else:
                         found.Click()
@@ -326,47 +334,43 @@ class CallHandler:
                 except Exception:
                     pass
 
-            # 2. Debug: listázzuk az összes vezérlőt a fő ablakban
-            print("[UIA] Nem találtam 'Accept' nevűt – összes vezérlő:")
+        except Exception as e:
+            print(f"[UIA] _click_label_or_parent hiba: {e}")
+        return False
+
+    def _click_via_uia(self, hwnd) -> bool:
+        """Accept gomb keresése és kattintás – _click_label_or_parent segítségével."""
+        accept_names = ["Accept", "Accept call", "Answer", "Answer call", "Fogadás", "Elfogad"]
+
+        if self._click_label_or_parent(hwnd, accept_names):
+            return True
+
+        # Fallback: listázzuk a felső sávban lévő összes vezérlőt (debug)
+        try:
+            ctrl = auto.ControlFromHandle(hwnd)
+            if ctrl is None:
+                return False
+
+            print("[UIA] Accept nem találva – vezérlők a felső sávban:")
             all_ctrls: list = []
             self._collect_all_controls(ctrl, all_ctrls, depth=6)
 
-            window_rect = win32gui.GetWindowRect(hwnd)
-            win_top = window_rect[1]
+            win_top = win32gui.GetWindowRect(hwnd)[1]
             call_bar_bottom = win_top + 250
 
             for c in all_ctrls:
                 try:
                     r = c.BoundingRectangle
-                    name = c.Name or ""
-                    ctype = c.ControlTypeName
-                    # Kiírjuk a felső 250px-en lévő összes elemet (AutomationId-val)
                     if r.top < call_bar_bottom and r.width() > 5 and r.height() > 5:
-                        print(f"  [{ctype}] name='{name}' id='{c.AutomationId}' "
-                              f"@ ({r.left},{r.top}) {r.width()}x{r.height()}")
+                        print(f"  [{c.ControlTypeName}] name='{c.Name}' "
+                              f"id='{c.AutomationId}' @ ({r.left},{r.top}) "
+                              f"{r.width()}x{r.height()}")
                 except Exception:
                     pass
-
-            # 3. Kattintás az első kattintható elemre a felső sávban
-            for c in all_ctrls:
-                try:
-                    r = c.BoundingRectangle
-                    if r.top < call_bar_bottom and r.width() > 20 and r.height() > 20:
-                        patterns = c.GetSupportedPatterns()
-                        # InvokePattern = kattintható/aktiválható elem
-                        if any("Invoke" in str(p) for p in patterns):
-                            print(f"[UIA] Kattintás: '{c.Name}' @ ({r.left},{r.top})")
-                            c.Click()
-                            return True
-                except Exception:
-                    pass
-
-            print("[UIA] Nem találtam kattintható elemet")
-            return False
-
         except Exception as e:
-            print(f"[UIA] Hiba: {e}")
-            return False
+            print(f"[UIA] debug hiba: {e}")
+
+        return False
 
     def _collect_all_controls(self, ctrl, result: list, depth: int):
         """Rekurzívan összegyűjti az összes UIA vezérlőt."""
