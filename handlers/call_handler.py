@@ -293,20 +293,36 @@ class CallHandler:
                 return False
 
             # 1. Keresés névvel – BÁRMILYEN vezérlőtípusban
-            # (Telegram Qt nem mindig ButtonControl-ként regisztrál)
             accept_names = [
                 "Accept", "Accept call", "Answer", "Answer call",
                 "Fogadás", "Elfogad",
             ]
             for name in accept_names:
                 try:
-                    # Control() = bármilyen típus
                     found = ctrl.Control(searchDepth=10, Name=name)
-                    if found.Exists(maxSearchSeconds=0.5):
-                        print(f"[UIA] Vezérlő megtalálva: '{name}' "
-                              f"(típus: {found.ControlTypeName})")
+                    if not found.Exists(maxSearchSeconds=0.5):
+                        continue
+
+                    r = found.BoundingRectangle
+                    ctype = found.ControlTypeName
+                    aid = found.AutomationId or ""
+                    print(f"[UIA] Megtalálva: '{name}' ({ctype}) id='{aid}' @ ({r.left},{r.top}) {r.width()}x{r.height()}")
+
+                    # Ha szöveg/label: keressük a szülőjét (az a tényleges gomb)
+                    label_types = {"TextControl", "StaticControl", "LabelControl"}
+                    if ctype in label_types:
+                        parent = found.GetParentControl()
+                        if parent is not None:
+                            pr = parent.BoundingRectangle
+                            print(f"[UIA] Szülő: '{parent.Name}' ({parent.ControlTypeName}) id='{parent.AutomationId}' @ ({pr.left},{pr.top})")
+                            parent.Click()
+                        else:
+                            # nincs szülő: kattintunk fölé
+                            pyautogui.click(r.left + r.width() // 2, r.top - 35)
+                    else:
                         found.Click()
-                        return True
+
+                    return True
                 except Exception:
                     pass
 
@@ -324,10 +340,10 @@ class CallHandler:
                     r = c.BoundingRectangle
                     name = c.Name or ""
                     ctype = c.ControlTypeName
-                    # Kiírjuk a felső 250px-en lévő összes elemet
+                    # Kiírjuk a felső 250px-en lévő összes elemet (AutomationId-val)
                     if r.top < call_bar_bottom and r.width() > 5 and r.height() > 5:
-                        print(f"  [{ctype}] '{name}' @ ({r.left},{r.top}) "
-                              f"{r.width()}x{r.height()}")
+                        print(f"  [{ctype}] name='{name}' id='{c.AutomationId}' "
+                              f"@ ({r.left},{r.top}) {r.width()}x{r.height()}")
                 except Exception:
                     pass
 
